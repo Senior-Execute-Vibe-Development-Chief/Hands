@@ -69,21 +69,34 @@ function updateSegment(mesh, start, end) {
   mesh.quaternion.setFromUnitVectors(new THREE.Vector3(0, 1, 0), direction.clone().normalize());
 }
 
-function normaliseWorldPoint(point, handIndex) {
-  const sideOffset = handIndex === 0 ? -0.38 : 0.38;
+/** Image landmarks: x,y in frame — drives translation in the 3D view. */
+function scenePointFromImageLm(point) {
   return new THREE.Vector3(
-    point.x * 4.7 + sideOffset,
-    -point.y * 4.7,
-    -point.z * 4.7
+    (point.x - 0.5) * 2.65,
+    -(point.y - 0.5) * 1.75,
+    -point.z * 2.45
   );
 }
 
-function normaliseImagePoint(point) {
-  return new THREE.Vector3(
-    (point.x - 0.5) * 1.8,
-    -(point.y - 0.5) * 1.2,
-    -point.z * 1.7
-  );
+/**
+ * MediaPipe world landmarks are wrist-rooted (wrist ≈ origin): they encode pose,
+ * not where the hand is in the room. Combine image wrist + world bone offsets
+ * so the hand translates and articulates.
+ */
+function landmarksToScenePoints(imageLm, worldLm, useWorldModel) {
+  if (!imageLm || imageLm.length < 21) return null;
+  if (useWorldModel && worldLm && worldLm.length >= 21) {
+    const wristScene = scenePointFromImageLm(imageLm[0]);
+    const w0 = worldLm[0];
+    return worldLm.map((w) => (
+      wristScene.clone().add(new THREE.Vector3(
+        (w.x - w0.x) * 5.35,
+        -(w.y - w0.y) * 5.35,
+        -(w.z - w0.z) * 5.35
+      ))
+    ));
+  }
+  return imageLm.map((p) => scenePointFromImageLm(p));
 }
 
 function createHandGroup(scene) {
@@ -99,15 +112,15 @@ function createHandGroup(scene) {
   return { group: root, dots, segments };
 }
 
-const GRAB_RADIUS = 0.17;
+const GRAB_RADIUS = 0.32;
 
 function createPickables(scene) {
   const configs = [
-    { geo: new THREE.BoxGeometry(0.13, 0.13, 0.13), pos: [-0.32, 0.12, -0.38], color: 0x6ae3ff },
-    { geo: new THREE.SphereGeometry(0.1, 20, 20), pos: [0.28, -0.02, -0.42], color: 0xffb86a },
-    { geo: new THREE.CylinderGeometry(0.07, 0.09, 0.16, 16), pos: [0.02, 0.18, -0.5], color: 0xc99dff },
-    { geo: new THREE.TetrahedronGeometry(0.12, 0), pos: [-0.15, -0.2, -0.36], color: 0x7cffc4 },
-    { geo: new THREE.OctahedronGeometry(0.11, 0), pos: [0.35, 0.2, -0.55], color: 0xff7cc8 }
+    { geo: new THREE.BoxGeometry(0.13, 0.13, 0.13), pos: [-0.22, 0.08, -0.32], color: 0x6ae3ff },
+    { geo: new THREE.SphereGeometry(0.1, 20, 20), pos: [0.2, 0.02, -0.34], color: 0xffb86a },
+    { geo: new THREE.CylinderGeometry(0.07, 0.09, 0.16, 16), pos: [0.02, 0.14, -0.38], color: 0xc99dff },
+    { geo: new THREE.TetrahedronGeometry(0.12, 0), pos: [-0.12, -0.12, -0.3], color: 0x7cffc4 },
+    { geo: new THREE.OctahedronGeometry(0.11, 0), pos: [0.22, 0.12, -0.4], color: 0xff7cc8 }
   ];
 
   const meshes = [];
@@ -212,7 +225,7 @@ function classifyGestures(landmarks) {
   };
 
   const extendedCount = Object.values(extended).filter(Boolean).length;
-  const pinch = pinchDistance < 0.42;
+  const pinch = pinchDistance < 0.48;
   const openPalm = extendedCount >= 4 && !pinch;
   const fist = extendedCount <= 1 && !pinch;
   const point = extended.index && !extended.middle && !extended.ring && !extended.pinky;
@@ -480,14 +493,15 @@ function App() {
       const hg = groups[handIndex];
       const label = handedness?.[handIndex]?.[0]?.categoryName || `Hand ${handIndex + 1}`;
       const score = handedness?.[handIndex]?.[0]?.score || 0;
-      const gestureSource = imageHands[handIndex] || landmarks;
+      const imageLm = imageHands[handIndex];
+      if (!imageLm?.length) return;
+
+      const gestureSource = imageLm;
       const gesture = classifyGestures(gestureSource);
 
-      let points = landmarks.map(point => (
-        useWorldCoords && worldHands.length
-          ? normaliseWorldPoint(point, handIndex)
-          : normaliseImagePoint(point)
-      ));
+      const useWorldModel = Boolean(useWorldCoords && worldHands.length && worldHands[handIndex]);
+      let points = landmarksToScenePoints(imageLm, worldHands[handIndex], useWorldModel);
+      if (!points) return;
 
       points = smoothPoints(`${label}-${handIndex}`, points);
 
@@ -606,7 +620,7 @@ function App() {
             <div className="panel-title">Prototype settings</div>
             <label className="toggle">
               <input type="checkbox" checked={useWorldCoords} onChange={e => setUseWorldCoords(e.target.checked)} />
-              <span>Use 3D world landmarks</span>
+              <span>Use world bone offsets (recommended)</span>
             </label>
             <label className="toggle">
               <input type="checkbox" checked={mirrorCamera} onChange={e => setMirrorCamera(e.target.checked)} />
@@ -617,7 +631,7 @@ function App() {
               <span>Show depth grid</span>
             </label>
             <div className="hint hint-block">
-              Objects share the 3D space with the skeleton. Pinch when the midpoint between thumb and index tips is near a shape.
+              Hand position follows your wrist in the camera frame; world offsets refine finger bends. Pinch when thumb and index tips straddle a shape.
             </div>
             <label className="slider">
               <span>Tracking confidence: {threshold.toFixed(2)}</span>
