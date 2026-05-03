@@ -87,16 +87,106 @@ function normaliseImagePoint(point) {
 }
 
 function createHandGroup(scene) {
-  const group = new THREE.Group();
+  const root = new THREE.Group();
   const dots = Array.from({ length: 21 }, (_, index) => makeDot(index));
   const segments = HAND_CONNECTIONS.map(() => makeSegment());
 
-  dots.forEach(dot => group.add(dot));
-  segments.forEach(segment => group.add(segment));
-  group.visible = false;
-  scene.add(group);
+  dots.forEach(dot => root.add(dot));
+  segments.forEach(segment => root.add(segment));
+  root.visible = false;
+  scene.add(root);
 
-  return { group, dots, segments };
+  return { group: root, dots, segments };
+}
+
+const GRAB_RADIUS = 0.17;
+
+function createPickables(scene) {
+  const configs = [
+    { geo: new THREE.BoxGeometry(0.13, 0.13, 0.13), pos: [-0.32, 0.12, -0.38], color: 0x6ae3ff },
+    { geo: new THREE.SphereGeometry(0.1, 20, 20), pos: [0.28, -0.02, -0.42], color: 0xffb86a },
+    { geo: new THREE.CylinderGeometry(0.07, 0.09, 0.16, 16), pos: [0.02, 0.18, -0.5], color: 0xc99dff },
+    { geo: new THREE.TetrahedronGeometry(0.12, 0), pos: [-0.15, -0.2, -0.36], color: 0x7cffc4 },
+    { geo: new THREE.OctahedronGeometry(0.11, 0), pos: [0.35, 0.2, -0.55], color: 0xff7cc8 }
+  ];
+
+  const meshes = [];
+  for (const c of configs) {
+    const mat = new THREE.MeshStandardMaterial({
+      color: c.color,
+      roughness: 0.38,
+      metalness: 0.12
+    });
+    const mesh = new THREE.Mesh(c.geo, mat);
+    mesh.position.set(c.pos[0], c.pos[1], c.pos[2]);
+    scene.add(mesh);
+    meshes.push(mesh);
+  }
+
+  const floor = new THREE.Mesh(
+    new THREE.PlaneGeometry(5, 4),
+    new THREE.MeshStandardMaterial({
+      color: 0x121a2e,
+      roughness: 0.94,
+      metalness: 0.02,
+      transparent: true,
+      opacity: 0.88
+    })
+  );
+  floor.rotation.x = -Math.PI / 2;
+  floor.position.y = -0.78;
+  floor.name = 'play-floor';
+  scene.add(floor);
+
+  return meshes;
+}
+
+function meshHeldByOtherHand(mesh, myHandIndex, grabState) {
+  for (let i = 0; i < grabState.length; i += 1) {
+    if (i === myHandIndex) continue;
+    const g = grabState[i];
+    if (g && g.mesh === mesh) return true;
+  }
+  return false;
+}
+
+function applyGrabInteraction(grabFrames, pickables, grabState, scratch) {
+  if (!pickables?.length) return;
+
+  for (const { handIndex, points, pinch } of grabFrames) {
+    const thumbTip = points[FINGER_TIPS.thumb];
+    const indexTip = points[FINGER_TIPS.index];
+    const pinchMid = scratch.pinchMid.copy(thumbTip).add(indexTip).multiplyScalar(0.5);
+
+    const held = grabState[handIndex];
+
+    if (held) {
+      if (!pinch) {
+        grabState[handIndex] = null;
+      } else {
+        held.mesh.position.copy(pinchMid).add(held.offset);
+      }
+      continue;
+    }
+
+    if (!pinch) continue;
+
+    let best = null;
+    let bestD = GRAB_RADIUS;
+    for (const mesh of pickables) {
+      if (meshHeldByOtherHand(mesh, handIndex, grabState)) continue;
+      const d = pinchMid.distanceTo(mesh.position);
+      if (d < bestD) {
+        bestD = d;
+        best = mesh;
+      }
+    }
+
+    if (best) {
+      const offset = best.position.clone().sub(pinchMid);
+      grabState[handIndex] = { mesh: best, offset };
+    }
+  }
 }
 
 function classifyGestures(landmarks) {
@@ -160,6 +250,9 @@ function App() {
   const lastVideoTimeRef = useRef(-1);
   const fpsRef = useRef({ frames: 0, last: performance.now() });
   const historyRef = useRef({});
+  const pickablesRef = useRef([]);
+  const grabStateRef = useRef([null, null]);
+  const scratchRef = useRef({ pinchMid: new THREE.Vector3() });
 
   const [status, setStatus] = useState('idle');
   const [error, setError] = useState('');
@@ -217,6 +310,7 @@ function App() {
     scene.add(grid);
 
     handGroupsRef.current = [createHandGroup(scene), createHandGroup(scene)];
+    pickablesRef.current = createPickables(scene);
 
     function resize() {
       const width = mount.clientWidth || 900;
@@ -311,6 +405,7 @@ function App() {
     streamRef.current = null;
     setHands([]);
     setFps(0);
+    grabStateRef.current = [null, null];
     handGroupsRef.current.forEach(({ group }) => {
       group.visible = false;
     });
@@ -374,12 +469,15 @@ function App() {
     const handedness = results.handednesses || [];
     const sourceHands = useWorldCoords && worldHands.length ? worldHands : imageHands;
 
-    groups.forEach(({ group }) => {
-      group.visible = false;
+    groups.forEach((hg) => {
+      hg.group.visible = false;
     });
 
-    const handSummaries = sourceHands.slice(0, 2).map((landmarks, handIndex) => {
-      const group = groups[handIndex];
+    const handSummaries = [];
+    const grabFrames = [];
+
+    sourceHands.slice(0, 2).forEach((landmarks, handIndex) => {
+      const hg = groups[handIndex];
       const label = handedness?.[handIndex]?.[0]?.categoryName || `Hand ${handIndex + 1}`;
       const score = handedness?.[handIndex]?.[0]?.score || 0;
       const gestureSource = imageHands[handIndex] || landmarks;
@@ -393,23 +491,38 @@ function App() {
 
       points = smoothPoints(`${label}-${handIndex}`, points);
 
-      group.group.visible = true;
+      hg.group.visible = true;
       points.forEach((point, index) => {
-        group.dots[index].visible = true;
-        group.dots[index].position.copy(point);
+        hg.dots[index].visible = true;
+        hg.dots[index].position.copy(point);
       });
 
       HAND_CONNECTIONS.forEach(([a, b], index) => {
-        updateSegment(group.segments[index], points[a], points[b]);
+        updateSegment(hg.segments[index], points[a], points[b]);
       });
 
-      return {
+      handSummaries.push({
         label,
         score,
         gesture: gesture.name,
         metrics: gesture.metrics
-      };
+      });
+
+      grabFrames.push({ handIndex, points, pinch: gesture.pinch });
     });
+
+    groups.forEach((hg, slotIndex) => {
+      if (!hg.group.visible) {
+        grabStateRef.current[slotIndex] = null;
+      }
+    });
+
+    applyGrabInteraction(
+      grabFrames,
+      pickablesRef.current,
+      grabStateRef.current,
+      scratchRef.current
+    );
 
     setHands(handSummaries);
   }
@@ -429,9 +542,9 @@ function App() {
       <section className="hero">
         <div>
           <div className="eyebrow">Usable prototype</div>
-          <h1>Webcam hand tracking → digital hand models</h1>
+          <h1>Webcam hand tracking → 3D hands & objects</h1>
           <p>
-            Tracks up to two hands from a normal webcam, maps the 21 landmarks to a live 3D skeleton, and reports basic gestures for gameplay prototyping.
+            Tracks up to two hands, shows a live 3D skeleton, and lets you pinch-grab colourful shapes in front of you. Open the pinch to release.
           </p>
         </div>
         <div className="controls-row">
@@ -449,8 +562,8 @@ function App() {
         <div className="stage-card">
           <div className="stage-header">
             <div>
-              <strong>3D hand model view</strong>
-              <span>Move your hands inside the camera frame.</span>
+              <strong>3D play space</strong>
+              <span>Pinch thumb and index near a shape to pick it up; open pinch to drop.</span>
             </div>
             <div className="pill-row">
               <span className="pill">{statusText}</span>
@@ -503,6 +616,9 @@ function App() {
               <input type="checkbox" checked={showGrid} onChange={e => setShowGrid(e.target.checked)} />
               <span>Show depth grid</span>
             </label>
+            <div className="hint hint-block">
+              Objects share the 3D space with the skeleton. Pinch when the midpoint between thumb and index tips is near a shape.
+            </div>
             <label className="slider">
               <span>Tracking confidence: {threshold.toFixed(2)}</span>
               <input

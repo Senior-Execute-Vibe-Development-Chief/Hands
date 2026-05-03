@@ -133,6 +133,11 @@ button:disabled {
   margin-top: 4px;
 }
 
+.hint-block {
+  margin-top: 12px;
+  line-height: 1.5;
+}
+
 .pill-row {
   display: flex;
   gap: 8px;
