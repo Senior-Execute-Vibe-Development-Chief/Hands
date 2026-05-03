@@ -1,0 +1,531 @@
+import React, { useEffect, useMemo, useRef, useState } from 'react';
+import { createRoot } from 'react-dom/client';
+import * as THREE from 'three';
+import { FilesetResolver, HandLandmarker } from '@mediapipe/tasks-vision';
+import './styles.css';
+
+const HAND_CONNECTIONS = [
+  [0, 1], [1, 2], [2, 3], [3, 4],
+  [0, 5], [5, 6], [6, 7], [7, 8],
+  [0, 9], [9, 10], [10, 11], [11, 12],
+  [0, 13], [13, 14], [14, 15], [15, 16],
+  [0, 17], [17, 18], [18, 19], [19, 20],
+  [5, 9], [9, 13], [13, 17]
+];
+
+const FINGER_TIPS = {
+  thumb: 4,
+  index: 8,
+  middle: 12,
+  ring: 16,
+  pinky: 20
+};
+
+const FINGER_PIPS = {
+  index: 6,
+  middle: 10,
+  ring: 14,
+  pinky: 18
+};
+
+const MODEL_URL = 'https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/latest/hand_landmarker.task';
+const WASM_URL = 'https://cdn.jsdelivr.net/npm/@mediapipe/tasks-vision@latest/wasm';
+
+function distance(a, b) {
+  const dx = a.x - b.x;
+  const dy = a.y - b.y;
+  const dz = (a.z || 0) - (b.z || 0);
+  return Math.sqrt(dx * dx + dy * dy + dz * dz);
+}
+
+function makeDot(index) {
+  const radius = index === 0 ? 0.025 : 0.016;
+  const geometry = new THREE.SphereGeometry(radius, 18, 18);
+  const material = new THREE.MeshStandardMaterial({ roughness: 0.36, metalness: 0.04 });
+  return new THREE.Mesh(geometry, material);
+}
+
+function makeSegment() {
+  const geometry = new THREE.CylinderGeometry(0.007, 0.007, 1, 14);
+  const material = new THREE.MeshStandardMaterial({ roughness: 0.4, metalness: 0.02 });
+  const mesh = new THREE.Mesh(geometry, material);
+  mesh.visible = false;
+  return mesh;
+}
+
+function updateSegment(mesh, start, end) {
+  const midpoint = new THREE.Vector3().addVectors(start, end).multiplyScalar(0.5);
+  const direction = new THREE.Vector3().subVectors(end, start);
+  const length = direction.length();
+
+  if (length < 0.0001) {
+    mesh.visible = false;
+    return;
+  }
+
+  mesh.visible = true;
+  mesh.position.copy(midpoint);
+  mesh.scale.set(1, length, 1);
+  mesh.quaternion.setFromUnitVectors(new THREE.Vector3(0, 1, 0), direction.clone().normalize());
+}
+
+function normaliseWorldPoint(point, handIndex) {
+  const sideOffset = handIndex === 0 ? -0.38 : 0.38;
+  return new THREE.Vector3(
+    point.x * 4.7 + sideOffset,
+    -point.y * 4.7,
+    -point.z * 4.7
+  );
+}
+
+function normaliseImagePoint(point) {
+  return new THREE.Vector3(
+    (point.x - 0.5) * 1.8,
+    -(point.y - 0.5) * 1.2,
+    -point.z * 1.7
+  );
+}
+
+function createHandGroup(scene) {
+  const group = new THREE.Group();
+  const dots = Array.from({ length: 21 }, (_, index) => makeDot(index));
+  const segments = HAND_CONNECTIONS.map(() => makeSegment());
+
+  dots.forEach(dot => group.add(dot));
+  segments.forEach(segment => group.add(segment));
+  group.visible = false;
+  scene.add(group);
+
+  return { group, dots, segments };
+}
+
+function classifyGestures(landmarks) {
+  if (!landmarks || landmarks.length < 21) {
+    return { name: 'No hand', pinch: false, openPalm: false, fist: false, point: false, metrics: {} };
+  }
+
+  const wrist = landmarks[0];
+  const indexTip = landmarks[FINGER_TIPS.index];
+  const thumbTip = landmarks[FINGER_TIPS.thumb];
+  const middleTip = landmarks[FINGER_TIPS.middle];
+  const ringTip = landmarks[FINGER_TIPS.ring];
+  const pinkyTip = landmarks[FINGER_TIPS.pinky];
+
+  const palmSize = Math.max(distance(wrist, landmarks[9]), 0.0001);
+  const pinchDistance = distance(thumbTip, indexTip) / palmSize;
+
+  const extended = {
+    index: distance(wrist, indexTip) > distance(wrist, landmarks[FINGER_PIPS.index]) * 1.18,
+    middle: distance(wrist, middleTip) > distance(wrist, landmarks[FINGER_PIPS.middle]) * 1.18,
+    ring: distance(wrist, ringTip) > distance(wrist, landmarks[FINGER_PIPS.ring]) * 1.14,
+    pinky: distance(wrist, pinkyTip) > distance(wrist, landmarks[FINGER_PIPS.pinky]) * 1.12
+  };
+
+  const extendedCount = Object.values(extended).filter(Boolean).length;
+  const pinch = pinchDistance < 0.42;
+  const openPalm = extendedCount >= 4 && !pinch;
+  const fist = extendedCount <= 1 && !pinch;
+  const point = extended.index && !extended.middle && !extended.ring && !extended.pinky;
+
+  let name = 'Neutral';
+  if (pinch) name = 'Pinch';
+  else if (openPalm) name = 'Open palm';
+  else if (fist) name = 'Fist / grab';
+  else if (point) name = 'Point';
+
+  return {
+    name,
+    pinch,
+    openPalm,
+    fist,
+    point,
+    metrics: {
+      palmSize: palmSize.toFixed(3),
+      pinchDistance: pinchDistance.toFixed(2),
+      extendedCount
+    }
+  };
+}
+
+function App() {
+  const videoRef = useRef(null);
+  const mountRef = useRef(null);
+  const rendererRef = useRef(null);
+  const sceneRef = useRef(null);
+  const cameraRef = useRef(null);
+  const handGroupsRef = useRef([]);
+  const landmarkerRef = useRef(null);
+  const streamRef = useRef(null);
+  const rafRef = useRef(null);
+  const lastVideoTimeRef = useRef(-1);
+  const fpsRef = useRef({ frames: 0, last: performance.now() });
+  const historyRef = useRef({});
+
+  const [status, setStatus] = useState('idle');
+  const [error, setError] = useState('');
+  const [hands, setHands] = useState([]);
+  const [fps, setFps] = useState(0);
+  const [mirrorCamera, setMirrorCamera] = useState(true);
+  const [useWorldCoords, setUseWorldCoords] = useState(true);
+  const [showGrid, setShowGrid] = useState(true);
+  const [threshold, setThreshold] = useState(0.55);
+
+  const isRunning = status === 'running';
+  const isBusy = status === 'loading model' || status === 'requesting camera';
+
+  const statusText = useMemo(() => {
+    if (status === 'idle') return 'Idle';
+    if (status === 'loading model') return 'Loading hand model';
+    if (status === 'requesting camera') return 'Waiting for camera permission';
+    if (status === 'running') return 'Tracking live';
+    if (status === 'error') return 'Error';
+    return status;
+  }, [status]);
+
+  useEffect(() => {
+    const mount = mountRef.current;
+    if (!mount) return;
+
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color(0x0b1020);
+    sceneRef.current = scene;
+
+    const camera = new THREE.PerspectiveCamera(52, 1, 0.01, 100);
+    camera.position.set(0, 0.08, 2.05);
+    cameraRef.current = camera;
+
+    const renderer = new THREE.WebGLRenderer({ antialias: true });
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 2));
+    rendererRef.current = renderer;
+    mount.appendChild(renderer.domElement);
+
+    const ambient = new THREE.AmbientLight(0xffffff, 0.75);
+    scene.add(ambient);
+
+    const keyLight = new THREE.DirectionalLight(0xffffff, 1.6);
+    keyLight.position.set(1.5, 2.2, 3.0);
+    scene.add(keyLight);
+
+    const fillLight = new THREE.DirectionalLight(0xffffff, 0.6);
+    fillLight.position.set(-2, -1, 2);
+    scene.add(fillLight);
+
+    const grid = new THREE.GridHelper(2.2, 10, 0x42506d, 0x232c3e);
+    grid.name = 'tracking-grid';
+    grid.rotation.x = Math.PI / 2;
+    grid.position.z = -0.55;
+    scene.add(grid);
+
+    handGroupsRef.current = [createHandGroup(scene), createHandGroup(scene)];
+
+    function resize() {
+      const width = mount.clientWidth || 900;
+      const height = mount.clientHeight || 560;
+      renderer.setSize(width, height, false);
+      camera.aspect = width / height;
+      camera.updateProjectionMatrix();
+    }
+
+    function render() {
+      const gridObject = scene.getObjectByName('tracking-grid');
+      if (gridObject) gridObject.visible = showGrid;
+      renderer.render(scene, camera);
+      rafRef.current = requestAnimationFrame(render);
+    }
+
+    resize();
+    window.addEventListener('resize', resize);
+    rafRef.current = requestAnimationFrame(render);
+
+    return () => {
+      window.removeEventListener('resize', resize);
+      if (rafRef.current) cancelAnimationFrame(rafRef.current);
+      stopCamera();
+      scene.traverse((object) => {
+        if (object.geometry) object.geometry.dispose?.();
+        if (object.material) object.material.dispose?.();
+      });
+      renderer.dispose();
+      renderer.domElement.remove();
+    };
+    // showGrid is intentionally read dynamically in render loop.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  async function loadLandmarker() {
+    if (landmarkerRef.current) return landmarkerRef.current;
+
+    setStatus('loading model');
+    const vision = await FilesetResolver.forVisionTasks(WASM_URL);
+    const landmarker = await HandLandmarker.createFromOptions(vision, {
+      baseOptions: {
+        modelAssetPath: MODEL_URL,
+        delegate: 'GPU'
+      },
+      runningMode: 'VIDEO',
+      numHands: 2,
+      minHandDetectionConfidence: threshold,
+      minHandPresenceConfidence: threshold,
+      minTrackingConfidence: threshold
+    });
+
+    landmarkerRef.current = landmarker;
+    return landmarker;
+  }
+
+  async function startCamera() {
+    setError('');
+
+    try {
+      const landmarker = await loadLandmarker();
+      setStatus('requesting camera');
+
+      const stream = await navigator.mediaDevices.getUserMedia({
+        audio: false,
+        video: {
+          width: { ideal: 1280 },
+          height: { ideal: 720 },
+          facingMode: 'user'
+        }
+      });
+
+      streamRef.current = stream;
+      const video = videoRef.current;
+      video.srcObject = stream;
+      video.muted = true;
+      video.playsInline = true;
+      await video.play();
+
+      setStatus('running');
+      lastVideoTimeRef.current = -1;
+      fpsRef.current = { frames: 0, last: performance.now() };
+      trackingLoop(landmarker);
+    } catch (err) {
+      setStatus('error');
+      setError(err?.message || 'Unable to start camera or load tracking model.');
+    }
+  }
+
+  function stopCamera() {
+    streamRef.current?.getTracks().forEach(track => track.stop());
+    streamRef.current = null;
+    setHands([]);
+    setFps(0);
+    handGroupsRef.current.forEach(({ group }) => {
+      group.visible = false;
+    });
+    if (status !== 'error') setStatus('idle');
+  }
+
+  function trackingLoop(landmarker) {
+    const tick = () => {
+      const video = videoRef.current;
+      if (!video || !streamRef.current) return;
+
+      if (video.readyState >= 2 && video.currentTime !== lastVideoTimeRef.current) {
+        const now = performance.now();
+        const results = landmarker.detectForVideo(video, now);
+        lastVideoTimeRef.current = video.currentTime;
+        updateHands(results);
+        updateFps(now);
+      }
+
+      requestAnimationFrame(tick);
+    };
+
+    requestAnimationFrame(tick);
+  }
+
+  function updateFps(now) {
+    const state = fpsRef.current;
+    state.frames += 1;
+    if (now - state.last >= 1000) {
+      setFps(state.frames);
+      state.frames = 0;
+      state.last = now;
+    }
+  }
+
+  function smoothPoints(handKey, points) {
+    const alpha = 0.42;
+    const previous = historyRef.current[handKey];
+    if (!previous) {
+      historyRef.current[handKey] = points;
+      return points;
+    }
+
+    const smoothed = points.map((point, index) => {
+      const old = previous[index] || point;
+      return new THREE.Vector3(
+        old.x * (1 - alpha) + point.x * alpha,
+        old.y * (1 - alpha) + point.y * alpha,
+        old.z * (1 - alpha) + point.z * alpha
+      );
+    });
+
+    historyRef.current[handKey] = smoothed;
+    return smoothed;
+  }
+
+  function updateHands(results) {
+    const groups = handGroupsRef.current;
+    const imageHands = results.landmarks || [];
+    const worldHands = results.worldLandmarks || [];
+    const handedness = results.handednesses || [];
+    const sourceHands = useWorldCoords && worldHands.length ? worldHands : imageHands;
+
+    groups.forEach(({ group }) => {
+      group.visible = false;
+    });
+
+    const handSummaries = sourceHands.slice(0, 2).map((landmarks, handIndex) => {
+      const group = groups[handIndex];
+      const label = handedness?.[handIndex]?.[0]?.categoryName || `Hand ${handIndex + 1}`;
+      const score = handedness?.[handIndex]?.[0]?.score || 0;
+      const gestureSource = imageHands[handIndex] || landmarks;
+      const gesture = classifyGestures(gestureSource);
+
+      let points = landmarks.map(point => (
+        useWorldCoords && worldHands.length
+          ? normaliseWorldPoint(point, handIndex)
+          : normaliseImagePoint(point)
+      ));
+
+      points = smoothPoints(`${label}-${handIndex}`, points);
+
+      group.group.visible = true;
+      points.forEach((point, index) => {
+        group.dots[index].visible = true;
+        group.dots[index].position.copy(point);
+      });
+
+      HAND_CONNECTIONS.forEach(([a, b], index) => {
+        updateSegment(group.segments[index], points[a], points[b]);
+      });
+
+      return {
+        label,
+        score,
+        gesture: gesture.name,
+        metrics: gesture.metrics
+      };
+    });
+
+    setHands(handSummaries);
+  }
+
+  async function resetModelWithThreshold(value) {
+    setThreshold(value);
+    if (!landmarkerRef.current) return;
+    await landmarkerRef.current.setOptions({
+      minHandDetectionConfidence: value,
+      minHandPresenceConfidence: value,
+      minTrackingConfidence: value
+    });
+  }
+
+  return (
+    <main className="app-shell">
+      <section className="hero">
+        <div>
+          <div className="eyebrow">Usable prototype</div>
+          <h1>Webcam hand tracking → digital hand models</h1>
+          <p>
+            Tracks up to two hands from a normal webcam, maps the 21 landmarks to a live 3D skeleton, and reports basic gestures for gameplay prototyping.
+          </p>
+        </div>
+        <div className="controls-row">
+          {!isRunning ? (
+            <button className="primary" onClick={startCamera} disabled={isBusy}>
+              {isBusy ? 'Starting...' : 'Start tracking'}
+            </button>
+          ) : (
+            <button className="secondary" onClick={stopCamera}>Stop tracking</button>
+          )}
+        </div>
+      </section>
+
+      <section className="workspace">
+        <div className="stage-card">
+          <div className="stage-header">
+            <div>
+              <strong>3D hand model view</strong>
+              <span>Move your hands inside the camera frame.</span>
+            </div>
+            <div className="pill-row">
+              <span className="pill">{statusText}</span>
+              <span className="pill">{fps} FPS</span>
+              <span className="pill">{hands.length} hands</span>
+            </div>
+          </div>
+          <div className="stage" ref={mountRef} />
+        </div>
+
+        <aside className="side-panel">
+          <div className="panel-card">
+            <div className="panel-title">Camera</div>
+            <video ref={videoRef} className={mirrorCamera ? 'mirror' : ''} autoPlay playsInline muted />
+            <div className="hint">Camera access requires localhost or HTTPS. Running through Vite localhost works.</div>
+          </div>
+
+          <div className="panel-card">
+            <div className="panel-title">Detected gestures</div>
+            {hands.length === 0 ? (
+              <div className="empty">No hands detected yet.</div>
+            ) : (
+              hands.map((hand, index) => (
+                <div className="hand-readout" key={`${hand.label}-${index}`}>
+                  <div className="hand-title">
+                    <span>{hand.label}</span>
+                    <small>{Math.round(hand.score * 100)}%</small>
+                  </div>
+                  <div className="gesture">{hand.gesture}</div>
+                  <div className="metric-grid">
+                    <span>Pinch ratio</span><strong>{hand.metrics.pinchDistance ?? '—'}</strong>
+                    <span>Extended fingers</span><strong>{hand.metrics.extendedCount ?? '—'}</strong>
+                  </div>
+                </div>
+              ))
+            )}
+          </div>
+
+          <div className="panel-card">
+            <div className="panel-title">Prototype settings</div>
+            <label className="toggle">
+              <input type="checkbox" checked={useWorldCoords} onChange={e => setUseWorldCoords(e.target.checked)} />
+              <span>Use 3D world landmarks</span>
+            </label>
+            <label className="toggle">
+              <input type="checkbox" checked={mirrorCamera} onChange={e => setMirrorCamera(e.target.checked)} />
+              <span>Mirror camera preview</span>
+            </label>
+            <label className="toggle">
+              <input type="checkbox" checked={showGrid} onChange={e => setShowGrid(e.target.checked)} />
+              <span>Show depth grid</span>
+            </label>
+            <label className="slider">
+              <span>Tracking confidence: {threshold.toFixed(2)}</span>
+              <input
+                type="range"
+                min="0.3"
+                max="0.8"
+                step="0.05"
+                value={threshold}
+                onChange={e => resetModelWithThreshold(Number(e.target.value))}
+              />
+            </label>
+          </div>
+
+          {error && (
+            <div className="panel-card error">
+              <div className="panel-title">Error</div>
+              <p>{error}</p>
+            </div>
+          )}
+        </aside>
+      </section>
+    </main>
+  );
+}
+
+createRoot(document.getElementById('root')).render(<App />);
