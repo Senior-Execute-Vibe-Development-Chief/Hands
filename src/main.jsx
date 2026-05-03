@@ -112,7 +112,12 @@ function createHandGroup(scene) {
   return { group: root, dots, segments };
 }
 
-const GRAB_RADIUS = 0.32;
+/** Scene units: latch when hand anchor is this close to an object centre. */
+const LATCH_RADIUS = 0.34;
+/** Thumb–index distance ÷ palm size; above this while holding → release. */
+const RELEASE_SPREAD_RATIO = 0.58;
+/** Frames after drop before the same hand can latch again (reduces flicker). */
+const LATCH_COOLDOWN_FRAMES = 20;
 
 function createPickables(scene) {
   const configs = [
@@ -163,32 +168,37 @@ function meshHeldByOtherHand(mesh, myHandIndex, grabState) {
   return false;
 }
 
-function applyGrabInteraction(grabFrames, pickables, grabState, scratch) {
+function applyGrabInteraction(grabFrames, pickables, grabState, latchCooldown, scratch) {
   if (!pickables?.length) return;
 
-  for (const { handIndex, points, pinch } of grabFrames) {
+  for (let i = 0; i < latchCooldown.length; i += 1) {
+    if (latchCooldown[i] > 0) latchCooldown[i] -= 1;
+  }
+
+  for (const { handIndex, points, pinchRatio } of grabFrames) {
     const thumbTip = points[FINGER_TIPS.thumb];
     const indexTip = points[FINGER_TIPS.index];
-    const pinchMid = scratch.pinchMid.copy(thumbTip).add(indexTip).multiplyScalar(0.5);
+    const anchor = scratch.pinchMid.copy(thumbTip).add(indexTip).multiplyScalar(0.5);
 
     const held = grabState[handIndex];
 
     if (held) {
-      if (!pinch) {
+      if (pinchRatio > RELEASE_SPREAD_RATIO) {
         grabState[handIndex] = null;
+        latchCooldown[handIndex] = LATCH_COOLDOWN_FRAMES;
       } else {
-        held.mesh.position.copy(pinchMid).add(held.offset);
+        held.mesh.position.copy(anchor).add(held.offset);
       }
       continue;
     }
 
-    if (!pinch) continue;
+    if (latchCooldown[handIndex] > 0) continue;
 
     let best = null;
-    let bestD = GRAB_RADIUS;
+    let bestD = LATCH_RADIUS;
     for (const mesh of pickables) {
       if (meshHeldByOtherHand(mesh, handIndex, grabState)) continue;
-      const d = pinchMid.distanceTo(mesh.position);
+      const d = anchor.distanceTo(mesh.position);
       if (d < bestD) {
         bestD = d;
         best = mesh;
@@ -196,7 +206,7 @@ function applyGrabInteraction(grabFrames, pickables, grabState, scratch) {
     }
 
     if (best) {
-      const offset = best.position.clone().sub(pinchMid);
+      const offset = best.position.clone().sub(anchor);
       grabState[handIndex] = { mesh: best, offset };
     }
   }
@@ -204,7 +214,15 @@ function applyGrabInteraction(grabFrames, pickables, grabState, scratch) {
 
 function classifyGestures(landmarks) {
   if (!landmarks || landmarks.length < 21) {
-    return { name: 'No hand', pinch: false, openPalm: false, fist: false, point: false, metrics: {} };
+    return {
+      name: 'No hand',
+      pinch: false,
+      openPalm: false,
+      fist: false,
+      point: false,
+      pinchRatio: 2,
+      metrics: {}
+    };
   }
 
   const wrist = landmarks[0];
@@ -242,6 +260,7 @@ function classifyGestures(landmarks) {
     openPalm,
     fist,
     point,
+    pinchRatio: pinchDistance,
     metrics: {
       palmSize: palmSize.toFixed(3),
       pinchDistance: pinchDistance.toFixed(2),
@@ -265,6 +284,7 @@ function App() {
   const historyRef = useRef({});
   const pickablesRef = useRef([]);
   const grabStateRef = useRef([null, null]);
+  const latchCooldownRef = useRef([0, 0]);
   const scratchRef = useRef({ pinchMid: new THREE.Vector3() });
 
   const [status, setStatus] = useState('idle');
@@ -419,6 +439,7 @@ function App() {
     setHands([]);
     setFps(0);
     grabStateRef.current = [null, null];
+    latchCooldownRef.current = [0, 0];
     handGroupsRef.current.forEach(({ group }) => {
       group.visible = false;
     });
@@ -522,12 +543,13 @@ function App() {
         metrics: gesture.metrics
       });
 
-      grabFrames.push({ handIndex, points, pinch: gesture.pinch });
+      grabFrames.push({ handIndex, points, pinchRatio: gesture.pinchRatio });
     });
 
     groups.forEach((hg, slotIndex) => {
       if (!hg.group.visible) {
         grabStateRef.current[slotIndex] = null;
+        latchCooldownRef.current[slotIndex] = 0;
       }
     });
 
@@ -535,6 +557,7 @@ function App() {
       grabFrames,
       pickablesRef.current,
       grabStateRef.current,
+      latchCooldownRef.current,
       scratchRef.current
     );
 
@@ -558,7 +581,7 @@ function App() {
           <div className="eyebrow">Usable prototype</div>
           <h1>Webcam hand tracking → 3D hands & objects</h1>
           <p>
-            Tracks up to two hands, shows a live 3D skeleton, and lets you pinch-grab colourful shapes in front of you. Open the pinch to release.
+            Tracks up to two hands and a 3D skeleton. Shapes latch on automatically when your hand gets close; spread thumb and index apart to let go.
           </p>
         </div>
         <div className="controls-row">
@@ -577,7 +600,7 @@ function App() {
           <div className="stage-header">
             <div>
               <strong>3D play space</strong>
-              <span>Pinch thumb and index near a shape to pick it up; open pinch to drop.</span>
+              <span>Move near a shape to latch; spread thumb and index to release.</span>
             </div>
             <div className="pill-row">
               <span className="pill">{statusText}</span>
@@ -631,7 +654,7 @@ function App() {
               <span>Show depth grid</span>
             </label>
             <div className="hint hint-block">
-              Hand position follows your wrist in the camera frame; world offsets refine finger bends. Pinch when thumb and index tips straddle a shape.
+              Hand position follows your wrist in the camera frame; world offsets refine finger bends. Objects auto-latch when the thumb–index midpoint is near them.
             </div>
             <label className="slider">
               <span>Tracking confidence: {threshold.toFixed(2)}</span>
